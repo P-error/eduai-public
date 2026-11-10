@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/**/*.py": {
+      "includeFiles": "artifacts/runtime/eduai_native_pedagogy/catboost_candidate_scorer_v1/**",
+      "excludeFiles": "{.next,node_modules,ml,training_datasets,bootstrap_training,exports,tmp,reports,codex-report,eduai-clean}/**"
+    }
+  }
+}

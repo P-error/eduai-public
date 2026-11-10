@@ -1,0 +1,136 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/test-results/
+.pytest_cache/
+**/.pytest_cache/
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+PROJECT_CONTEXT.md
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.log
+.logs/
+
+# env files
+.env*
+!.env.example
+!.env.production.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+ml/exports/
+exports/
+*.sqlite
+*.sqlite3
+configs/*.local.json
+
+# local Python environments
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+**/env/
+
+# generated review/export packs
+/outputs/
+/exports/
+
+# local Codex/agent files
+/AGENTS.md
+/ml/AGENTS.md
+/codex_report*.md
+/codex_*_report*.md
+**/codex_report*.md
+**/codex_*_report*.md
+
+# local reports and one-off audits
+/reports/
+/codex-report/
+/reports/codex/
+/reports/archive/
+/reports/audits/
+/repo_tree*.txt
+repo_tree*.txt
+repo_audit*.md
+/repo_cleanup_execution_report.md
+/repo_stale_files_audit.md
+/eduai_v18_actual_config_audit.sql
+/eduai_v18_exporter_actual_config_fix.patch
+/run_v18_ml_pipeline.sh
+/mk.sh
+
+# local archives and review packs
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+/backup/
+/eduai_vercel_export_*/
+review_pack/
+source_pack/
+audit_pack/
+audit_bundles/
+review_bundles/
+
+# local artifacts
+/1805/
+/eduai_clean_*.tar.gz
+/tmp/
+/eduai-clean/*
+!/eduai-clean/.gitkeep
+/training_datasets/*
+!/training_datasets/README.md
+!/training_datasets/synthetic/
+!/training_datasets/real/
+/training_datasets/synthetic/*
+!/training_datasets/synthetic/README.md
+/training_datasets/real/*
+!/training_datasets/real/README.md
+/bootstrap_training/eduai_native_synthetic/.venv/
+/bootstrap_training/eduai_native_synthetic/data/
+/artifacts/*
+!/artifacts/runtime/
+/artifacts/runtime/*
+!/artifacts/runtime/eduai_native_pedagogy/
+/artifacts/runtime/eduai_native_pedagogy/*
+!/artifacts/runtime/eduai_native_pedagogy/current/
+/artifacts/runtime/eduai_native_pedagogy/current/*
+!/artifacts/runtime/eduai_native_pedagogy/current/README.md
+!/artifacts/runtime/eduai_native_pedagogy/current/slot_metadata.json
+!/artifacts/runtime/eduai_native_pedagogy/thu_linear_candidate_scorer_v1/
+!/artifacts/runtime/eduai_native_pedagogy/thu_linear_candidate_scorer_v1/artifact.json
+!/artifacts/runtime/eduai_native_pedagogy/thu_linear_candidate_scorer_v1/runtime_manifest.json

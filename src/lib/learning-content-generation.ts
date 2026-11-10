@@ -1,0 +1,666 @@
+import { getActivePromptTemplate, renderPrompt } from "@/lib/prompts";
+import {
+  llmChatJsonWithRepair,
+  type LlmJsonCallDiagnostics,
+} from "@/lib/llm/provider";
+import { createChatSessionWithMessages, type ChatSessionMeta } from "@/lib/chat";
+import { prisma } from "@/lib/prisma";
+import {
+  appendPromptBlocks,
+  buildLearningContentSystemPrompt,
+} from "@/lib/llm-prompt-builders";
+import {
+  buildEvaluationItemMeta,
+  registerEvaluationEpisodeItem,
+  resolveOrCreateEvaluationEpisode,
+  type EvaluationAssignmentMeta,
+  type EvaluationItemMeta,
+  type EvaluationRequestInput,
+} from "@/lib/evaluation";
+import {
+  buildLearningContentPrompt,
+  renderLearningContentCard,
+  LEARNING_CONTENT_CARD_SCHEMA_VERSION,
+  type LearningContentCard,
+  type LearningContentGenerationPackage,
+} from "@/lib/episode-generation";
+import {
+  attachLearningContentSchemaVersion,
+  LearningContentCardSchema,
+  validateLearningContentCard,
+  type LearningContentValidationResult,
+} from "@/lib/learning-content-schema";
+import {
+  buildSixFactorPedagogicalPromptProfileFromMetadata,
+  type SixFactorPedagogicalPromptProfileV1,
+} from "@/lib/ml-six-factor-render-mapping";
+import { buildAppliedSixFactorPromptInstructions } from "@/lib/ml-six-factor-apply";
+import {
+  buildOptionalSixFactorDeliveredConfigMetadata,
+  type SixFactorDeliveredConfigMetadataV1,
+} from "@/lib/ml-six-factor-decision-metadata";
+import {
+  buildOptionalSixFactorShadowMetadata,
+  isSixFactorShadowEnabled,
+} from "@/lib/ml-six-factor-shadow";
+import {
+  buildPrimarySixFactorDecisionOverride,
+  buildPrimarySixFactorDeliveredConfigMetadata,
+  buildPrimarySixFactorPromptContext,
+  buildSixFactorCompatibilityPedagogicalDecisionFromMetadata,
+  isPrimarySixFactorDecisionMetadata,
+  withPrimarySixFactorDecisionRefs,
+} from "@/lib/ml-six-factor-primary-decision";
+import { buildLearnerStateAggregatesForSixFactorPolicy } from "@/lib/ml-six-factor-learner-state-features";
+import { sanitizePreferenceMap } from "@/lib/tags";
+import { type GenerateTestUser } from "@/lib/test-generation";
+import { type TrainingDatasetCollectionMeta } from "@/lib/training-dataset-contract";
+
+export type GenerateLearningContentPlan = {
+  personalizationMode: "on" | "off";
+  assignment: EvaluationAssignmentMeta;
+  policyMode: string | null;
+  policyId: string | null;
+  pedagogicalDecision: {
+    difficulty: string;
+    depth: string;
+  };
+  renderingDecision: {
+    tone: string;
+    explanation_style: string;
+    response_format: "mcq";
+  };
+  renderingRules: {
+    id: string;
+    basis: string;
+  };
+  sixFactorPrimaryDecision: SixFactorDeliveredConfigMetadataV1 | null;
+};
+
+export type GenerateLearningContentParams = {
+  user: GenerateTestUser;
+  subject: {
+    id: string;
+    title: string;
+  };
+  sectionId?: string | null;
+  sectionSnapshot?: string | null;
+  topic: string;
+  evaluation: EvaluationRequestInput;
+  familyKey: string;
+  plan: GenerateLearningContentPlan;
+  priorTestOutcome?: {
+    contentId: string;
+    accuracy: number | null;
+    questionCount: number | null;
+    totalDurationMs: number | null;
+    submittedAtIso: string | null;
+  } | null;
+} & TrainingDatasetCollectionMeta;
+
+export type GeneratedLearningContentArtifact = {
+  sessionId: string;
+  evaluationEpisodeId: string;
+  evaluation: EvaluationItemMeta;
+  generationSource: "llm" | "llm_repaired" | "fallback";
+  generationPackage: LearningContentGenerationPackage;
+  card: LearningContentCard;
+  renderedContent: string;
+  sixFactorDeliveredConfig: SixFactorDeliveredConfigMetadataV1 | null;
+};
+
+function buildFallbackCard(params: {
+  topic: string;
+  difficulty: string;
+  depth: string;
+  tone: string;
+  explanationStyle: string;
+  sixFactorProfile?: SixFactorPedagogicalPromptProfileV1 | null;
+  priorTestOutcome?: GenerateLearningContentParams["priorTestOutcome"];
+}) {
+  const priorAccuracy =
+    params.priorTestOutcome?.accuracy != null
+      ? `${Math.round(params.priorTestOutcome.accuracy * 100)}%`
+      : "unknown";
+  const guidance = params.sixFactorProfile?.factorGuidance ?? null;
+  const support = guidance?.supportLevel.value ?? "guided";
+  const presentation = guidance?.presentationFormat.value ?? "structured_list";
+  const examples = guidance?.examplesLevel.value ?? "single";
+  const terminology = guidance?.terminologyLevel.value ?? "balanced";
+  const terminologyLine =
+    terminology === "simple"
+      ? "Use plain wording and define only the necessary terms."
+      : terminology === "technical"
+        ? "Use precise subject terms and define each important term briefly."
+        : "Use standard subject terms and define them only when needed.";
+  const supportLine =
+    support === "minimal"
+      ? "Hint: focus on the core rule first, then try the next check."
+      : support === "scaffolded"
+        ? "Check: follow the steps, explain each step to yourself, then solve one similar item."
+        : "Next step: name the rule, apply it once, and verify the answer.";
+  const coreBody =
+    presentation === "qa"
+      ? `Question: what matters most in ${params.topic}? Answer: identify the rule, connect it to the current task, and keep the explanation ${params.explanationStyle}. ${terminologyLine}`
+      : presentation === "step_by_step"
+        ? `1. Identify the core rule for ${params.topic}. 2. Apply it to the current task. 3. Check whether the answer follows the rule. ${terminologyLine}`
+        : presentation === "paragraph"
+          ? `Focus on the main concept behind ${params.topic} and keep the explanation ${params.explanationStyle} in a ${params.tone} tone. ${terminologyLine}`
+          : `- Core rule for ${params.topic}\n- Apply the rule to the task\n- Check the result\n${terminologyLine}`;
+  const sections: LearningContentCard["sections"] = [
+    {
+      heading: "Core idea",
+      body: coreBody,
+    },
+  ];
+
+  if (examples === "single") {
+    sections.push({
+      heading: "One example:",
+      body: `A learner can connect ${params.topic} to the next assessment by naming the rule first, then checking whether the answer follows it. The latest precheck accuracy in this episode was ${priorAccuracy}.`,
+    });
+  } else if (examples === "multiple") {
+    sections.push({
+      heading: "Examples:",
+      body: `Example 1: apply the rule directly to a familiar task. Example 2: compare it with a near miss and explain why the near miss fails. Latest precheck accuracy in this episode: ${priorAccuracy}.`,
+    });
+  }
+
+  sections.push({
+    heading: support === "scaffolded" ? "Guided steps" : "Practice cue",
+    body: supportLine,
+  });
+  sections.push({
+    heading: "Check:",
+    body: `Check: name one rule from ${params.topic} that you would verify before the next assessment step.`,
+  });
+
+  return {
+    schemaVersion: LEARNING_CONTENT_CARD_SCHEMA_VERSION,
+    title: `${params.topic}: guided explanation`,
+    summary: `This episode step explains the core idea at ${params.difficulty} difficulty and ${params.depth} depth with ${support} support, ${presentation} organization, ${examples} examples, and ${terminology} terminology.`,
+    sections: sections.slice(0, 4),
+    reflectionPrompt: `What is the key idea you would use to solve the next task on ${params.topic}?`,
+  } satisfies LearningContentCard;
+}
+
+function validationMessages(result: LearningContentValidationResult) {
+  return [...result.errors, ...result.warnings].map((issue) =>
+    `${issue.path ? `${issue.path}:` : ""}${issue.code}: ${issue.message}`,
+  );
+}
+
+function buildLearningContentPackage(params: {
+  episodeId: string;
+  protocolKey: string;
+  subjectId: string;
+  subjectTitle: string;
+  sectionId: string | null;
+  sectionSnapshot: string | null;
+  topic: string;
+  conceptKey: string | null;
+  skillKey: string | null;
+  familyKey: string;
+  plan: GenerateLearningContentPlan;
+  evaluation: EvaluationItemMeta;
+  priorTestOutcome?: GenerateLearningContentParams["priorTestOutcome"];
+}) {
+  return {
+    schemaVersion: "episode_generation_package_v1_2026_03",
+    episodeId: params.episodeId,
+    protocolKey: params.protocolKey,
+    contentKind: "chat_session",
+    sequenceRole: params.evaluation.sequenceRole,
+    touchpointType: params.evaluation.touchpointType,
+    sixFactorPedagogicalProfile:
+      isPrimarySixFactorDecisionMetadata(params.plan.sixFactorPrimaryDecision)
+        ? buildSixFactorPedagogicalPromptProfileFromMetadata(
+            params.plan.sixFactorPrimaryDecision,
+            "learning_content",
+          )
+        : null,
+    pedagogicalDecision: params.plan.pedagogicalDecision,
+    rendering: {
+      tone: params.plan.renderingDecision.tone,
+      explanationStyle: params.plan.renderingDecision.explanation_style,
+      responseFormat: params.plan.renderingDecision.response_format,
+      rulesLayer: params.plan.renderingRules,
+      renderingDecision: {
+        tone: params.plan.renderingDecision.tone,
+        explanationStyle: params.plan.renderingDecision.explanation_style,
+        responseFormat: params.plan.renderingDecision.response_format,
+        presentationMode: "structured_chat",
+        formattingHint:
+          params.plan.pedagogicalDecision.depth === "detailed"
+            ? "scaffolded"
+            : params.plan.pedagogicalDecision.depth === "brief"
+              ? "brief"
+              : "balanced",
+      },
+    },
+    policy: {
+      arm: params.plan.assignment.arm,
+      policyMode: params.plan.policyMode,
+      policyId: params.plan.policyId,
+      assignmentSource: params.plan.assignment.assignmentSource,
+      personalizationMode: params.plan.personalizationMode,
+    },
+    scope: {
+      subjectId: params.subjectId,
+      subjectTitle: params.subjectTitle,
+      sectionId: params.sectionId,
+      sectionPath: params.sectionSnapshot,
+      topic: params.topic,
+      conceptKey: params.conceptKey,
+      skillKey: params.skillKey,
+      familyKey: params.familyKey,
+    },
+    linkage: {
+      linkageKind: params.evaluation.linkageKind,
+      linkedContentId: params.evaluation.linkedContentId,
+      holdoutStrategy: params.evaluation.holdoutStrategy,
+    },
+    priorTestOutcome: params.priorTestOutcome ?? null,
+    contentFormat: "structured_explanation_card",
+    outputContract: {
+      kind: "learning_content_card",
+      schemaVersion: LEARNING_CONTENT_CARD_SCHEMA_VERSION,
+    },
+  } satisfies LearningContentGenerationPackage;
+}
+
+export async function generateLearningContentForEpisode(
+  params: GenerateLearningContentParams,
+): Promise<GeneratedLearningContentArtifact> {
+  const declaredPreferences = sanitizePreferenceMap(
+    (params.user.declaredPreferencesJson ?? {}) as Record<string, unknown>,
+  );
+  const effectivePreferences = sanitizePreferenceMap(
+    (params.user.effectivePreferencesJson ?? {}) as Record<string, unknown>,
+  );
+
+  const resolvedEpisode = await resolveOrCreateEvaluationEpisode({
+    prisma,
+    userId: params.user.id,
+    subjectId: params.subject.id,
+    sectionId: params.sectionId ?? null,
+    topic: params.topic,
+    conceptKey: params.evaluation.conceptKey ?? null,
+    skillKey: params.evaluation.skillKey ?? null,
+    datasetPhase: params.datasetPhase ?? null,
+    datasetOrigin: params.datasetOrigin ?? null,
+    requested: params.evaluation,
+    assignment: params.plan.assignment,
+  });
+
+  const evaluation = buildEvaluationItemMeta({
+    episodeId: resolvedEpisode.episode.id,
+    assignment: params.plan.assignment,
+    requested: params.evaluation,
+    contentKind: "chat_session",
+    signalQuality: "secondary_chat_support",
+    protocolKey: resolvedEpisode.episode.protocolKey,
+    topic: params.topic,
+    subjectId: params.subject.id,
+    sectionId: params.sectionId ?? null,
+    pedagogicalDecision: params.plan.pedagogicalDecision,
+    runtimePolicyId: params.plan.assignment.runtimePolicyId,
+    backendKind: params.plan.assignment.backendKind,
+    backendId: params.plan.assignment.backendId,
+  });
+
+  const generationPackage = buildLearningContentPackage({
+    episodeId: resolvedEpisode.episode.id,
+    protocolKey: resolvedEpisode.episode.protocolKey,
+    subjectId: params.subject.id,
+    subjectTitle: params.subject.title,
+    sectionId: params.sectionId ?? null,
+    sectionSnapshot: params.sectionSnapshot ?? null,
+    topic: params.topic,
+    conceptKey: params.evaluation.conceptKey ?? null,
+    skillKey: params.evaluation.skillKey ?? null,
+    familyKey: params.familyKey,
+    plan: params.plan,
+    evaluation,
+    priorTestOutcome: params.priorTestOutcome,
+  });
+  const sixFactorDecisionAt = new Date();
+  const sixFactorDecisionAtIso = sixFactorDecisionAt.toISOString();
+  const primarySixFactorDecision = isPrimarySixFactorDecisionMetadata(
+    params.plan.sixFactorPrimaryDecision,
+  )
+    ? withPrimarySixFactorDecisionRefs(params.plan.sixFactorPrimaryDecision, {
+        sessionRef: resolvedEpisode.episode.id,
+      })
+    : null;
+  const learnerStateAggregates =
+    !primarySixFactorDecision && isSixFactorShadowEnabled()
+    ? await buildLearnerStateAggregatesForSixFactorPolicy({
+        prisma,
+        userId: params.user.id,
+        subjectId: params.subject.id,
+        topicRef: params.evaluation.conceptKey ?? null,
+        conceptKey: params.evaluation.conceptKey ?? null,
+        skillKey: params.evaluation.skillKey ?? null,
+        familyKey: params.familyKey,
+        topic: params.topic,
+        evaluationEpisodeId: resolvedEpisode.episode.id,
+        decisionCreatedAt: sixFactorDecisionAt,
+      })
+    : {};
+  const sixFactorPolicyContext =
+    buildPrimarySixFactorPromptContext(primarySixFactorDecision) ?? {
+      userRef: params.user.id,
+      subjectRef: params.subject.id,
+      topicRef: params.evaluation.conceptKey ?? null,
+      conceptKey: params.evaluation.conceptKey ?? null,
+      skillKey: params.evaluation.skillKey ?? null,
+      familyKey: params.familyKey,
+      topic: params.topic,
+      sessionRef: resolvedEpisode.episode.id,
+      ...learnerStateAggregates,
+      previousDifficulty: params.plan.pedagogicalDecision.difficulty,
+      previousDepth: params.plan.pedagogicalDecision.depth,
+      declaredPreferences: declaredPreferences,
+      policyId: params.plan.policyId,
+      backendKind: params.plan.assignment.backendKind,
+      modelVersion: null,
+    };
+  const sixFactorApply = buildAppliedSixFactorPromptInstructions({
+    context: sixFactorPolicyContext,
+    decisionOverride: buildPrimarySixFactorDecisionOverride(
+      primarySixFactorDecision,
+    ),
+    path: "learning_content",
+  });
+  const primarySixFactorPromptProfile =
+    buildSixFactorPedagogicalPromptProfileFromMetadata(
+      primarySixFactorDecision,
+      "learning_content",
+    );
+  const promptSixFactorProfile =
+    primarySixFactorPromptProfile ??
+    generationPackage.sixFactorPedagogicalProfile ??
+    sixFactorApply.shadow?.renderPolicy.pedagogicalProfile ??
+    null;
+  const activeSixFactorConfig =
+    primarySixFactorDecision?.deliveredConfig ??
+    sixFactorApply.metadata?.deliveredConfig ??
+    null;
+
+  const promptTemplate = await getActivePromptTemplate("learning_content_v1");
+  const baseSystemPrompt = renderPrompt(promptTemplate.template, {
+    declared: JSON.stringify(declaredPreferences),
+    effective: JSON.stringify(effectivePreferences),
+    ready: params.user.personalizationReady,
+  });
+  const systemPrompt = buildLearningContentSystemPrompt({
+    baseInstruction: baseSystemPrompt,
+    profile: {
+      userRef: params.user.id,
+      personalizationReady: params.user.personalizationReady,
+      declaredPreferences,
+      effectivePreferences,
+    },
+  });
+  const baseLearningContentPrompt = buildLearningContentPrompt(
+    generationPackage,
+    promptSixFactorProfile,
+  );
+  const learningContentPrompt = appendPromptBlocks(baseLearningContentPrompt, [
+    primarySixFactorPromptProfile
+      ? null
+      : sixFactorApply.promptInstructionBlock,
+  ]);
+
+  let generationSource: "llm" | "llm_repaired" | "fallback" = "llm";
+  let card: LearningContentCard | null = null;
+  let generationValidation: LearningContentValidationResult | null = null;
+  let llmJsonDiagnostics: LlmJsonCallDiagnostics | null = null;
+  let generationError: string | null = null;
+  const syntheticLlmDisabled = (() => {
+    const raw = process.env.EDUAI_SYNTHETIC_DISABLE_LLM?.trim().toLowerCase();
+    return raw === "1" || raw === "true" || raw === "yes";
+  })();
+  const llmGenerationAvailable =
+    !syntheticLlmDisabled &&
+    typeof process.env.OPENAI_API_KEY === "string" &&
+    process.env.OPENAI_API_KEY.trim().length > 0;
+  const maxGenerationAttempts = 2;
+  let validationFeedback: string[] = [];
+
+  for (let attempt = 1; attempt <= maxGenerationAttempts; attempt += 1) {
+    if (!llmGenerationAvailable) {
+      generationError = "LLM_GENERATION_DISABLED";
+      break;
+    }
+
+    const attemptPrompt = appendPromptBlocks(learningContentPrompt, [
+      validationFeedback.length > 0
+        ? [
+            "Regenerate the learning_content_card. The previous card failed validation:",
+            ...validationFeedback,
+            "Return a corrected full JSON card only.",
+          ].join("\n")
+        : null,
+    ]);
+    const response = await llmChatJsonWithRepair(
+      {
+        model: "gpt-4o-mini",
+        temperature: 0.5,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: systemPrompt },
+          {
+            role: "user",
+            content: attemptPrompt,
+          },
+        ],
+      },
+      LearningContentCardSchema,
+      {
+        contractName: "learning_content_card",
+        repairAttempts: 1,
+      },
+    );
+    llmJsonDiagnostics = response.diagnostics;
+    if (response.data == null) {
+      generationError =
+        response.diagnostics.providerError ??
+        response.diagnostics.schemaError ??
+        response.diagnostics.parseError ??
+        "LLM_JSON_INVALID";
+      validationFeedback = [generationError];
+      continue;
+    }
+
+    const candidateCard = attachLearningContentSchemaVersion(response.data);
+    const validation = validateLearningContentCard({
+      card: candidateCard,
+      topic: params.topic,
+      subjectTitle: params.subject.title,
+      sectionSnapshot: params.sectionSnapshot ?? null,
+      sixFactorConfig: activeSixFactorConfig,
+    });
+    generationValidation = validation;
+    if (!validation.valid) {
+      generationError = validationMessages(validation).join("; ");
+      validationFeedback = validationMessages(validation);
+      continue;
+    }
+
+    card = candidateCard;
+    generationSource =
+      response.diagnostics.finalSource === "llm_repaired"
+        ? "llm_repaired"
+        : "llm";
+    generationError = null;
+    break;
+  }
+
+  if (!card) {
+    generationSource = "fallback";
+    card = buildFallbackCard({
+      topic: params.topic,
+      difficulty: params.plan.pedagogicalDecision.difficulty,
+      depth: params.plan.pedagogicalDecision.depth,
+      tone: params.plan.renderingDecision.tone,
+      explanationStyle: params.plan.renderingDecision.explanation_style,
+      sixFactorProfile: promptSixFactorProfile,
+      priorTestOutcome: params.priorTestOutcome ?? null,
+    });
+    generationValidation = validateLearningContentCard({
+      card,
+      topic: params.topic,
+      subjectTitle: params.subject.title,
+      sectionSnapshot: params.sectionSnapshot ?? null,
+      sixFactorConfig: activeSixFactorConfig,
+    });
+    if (!generationError) {
+      generationError = "FALLBACK_GENERATION";
+    }
+  }
+
+  const learningEligible = generationSource !== "fallback";
+  const learningExcludedReason = learningEligible ? null : "FALLBACK_GENERATION";
+
+  const renderedContent = renderLearningContentCard(card);
+  const skipOptionalShadowAfterApplyFailure =
+    !sixFactorApply.applied &&
+    sixFactorApply.warnings.some((warning) =>
+      warning.startsWith("six_factor_apply_error:"),
+    );
+  const sixFactorShadowBase =
+    sixFactorApply.metadata ??
+    (skipOptionalShadowAfterApplyFailure
+      ? null
+      : buildOptionalSixFactorShadowMetadata(sixFactorPolicyContext));
+  const sixFactorShadow =
+    sixFactorShadowBase && sixFactorApply.applied && generationSource === "fallback"
+      ? {
+          ...sixFactorShadowBase,
+          warnings: [
+            ...sixFactorShadowBase.warnings,
+            "six_factor_apply_warning: LLM generation was unavailable; fallback content may only partially reflect six-factor render instructions.",
+          ],
+      }
+      : sixFactorShadowBase;
+  const sixFactorDeliveredConfig =
+    buildPrimarySixFactorDeliveredConfigMetadata({
+      primaryDecision: primarySixFactorDecision,
+      appliedMetadata: sixFactorApply.metadata,
+      appliedPath: "learning_content",
+      warnings:
+        generationSource === "fallback"
+          ? [
+              ...sixFactorApply.warnings,
+              "six_factor_apply_warning: LLM generation was unavailable; fallback content may only partially reflect six-factor render instructions.",
+            ]
+          : sixFactorApply.warnings,
+    }) ??
+    buildOptionalSixFactorDeliveredConfigMetadata({
+      sixFactorShadow,
+      decisionCreatedAt: sixFactorDecisionAtIso,
+      featuresCutoffAt: sixFactorDecisionAtIso,
+      appliedPath: "learning_content",
+    });
+  const auxiliarySixFactorShadow = sixFactorDeliveredConfig
+    ? null
+    : sixFactorShadow;
+  const sessionMeta: ChatSessionMeta = {
+    subjectId: params.subject.id,
+    promptTemplateId: promptTemplate.id,
+    llmModel: "gpt-4o-mini",
+    promptTemplateKey: promptTemplate.key,
+    promptTemplateVersion: promptTemplate.version,
+    promptTemplateSnapshot: promptTemplate.template,
+    declaredPreferencesJson: declaredPreferences,
+    effectivePreferencesJson: effectivePreferences,
+    personalizationReady: params.user.personalizationReady,
+  };
+
+  const stored = await prisma.$transaction(async (tx) => {
+    const session = await createChatSessionWithMessages({
+      userId: params.user.id,
+      messages: [
+        {
+          role: "assistant",
+          content: renderedContent,
+          signalsJson: {
+            source: "chat",
+            atIso: new Date().toISOString(),
+            deliveryMode: "episode_learning_content",
+            personalizationMode: params.plan.personalizationMode,
+            policyMode: params.plan.policyMode,
+            policyId: params.plan.policyId,
+            uxPreset: {
+              tone: params.plan.renderingDecision.tone,
+              explanation_style: params.plan.renderingDecision.explanation_style,
+            },
+            pedagogicalDecision:
+              sixFactorDeliveredConfig?.appliedAsPrimary === true
+                ? buildSixFactorCompatibilityPedagogicalDecisionFromMetadata(
+                    sixFactorDeliveredConfig,
+                  )
+                : params.plan.pedagogicalDecision,
+            rulesLayer: params.plan.renderingRules,
+            generationSource,
+            generationError,
+            generationValidation,
+            llmJsonDiagnostics,
+            learningEligible,
+            learningExcludedReason,
+            generationPackage,
+            learningContentCard: card,
+            evaluationSignal: {
+              quality: "secondary_chat_support",
+              role: "supporting_secondary",
+              testsRemainPrimary: true,
+            },
+            evaluation,
+            ...(auxiliarySixFactorShadow
+              ? { sixFactorShadow: auxiliarySixFactorShadow }
+              : {}),
+            ...(sixFactorDeliveredConfig ? { sixFactorDeliveredConfig } : {}),
+            messageStats: {
+              userChars: 0,
+              assistantChars: renderedContent.length,
+              turnLatencyMs: 0,
+            },
+            learning: {
+              uxUpdated: false,
+              skipReason:
+                learningExcludedReason ?? "EPISODE_CONTENT_STEP",
+              uxRewardChat: null,
+            },
+          },
+        },
+      ],
+      evaluationEpisodeId: resolvedEpisode.episode.id,
+      sessionMeta,
+      prismaClient: tx,
+    });
+
+    await registerEvaluationEpisodeItem({
+      prisma: tx,
+      item: evaluation,
+      contentId: session.sessionId,
+      decisionRuntimeSupplement: sixFactorDeliveredConfig
+        ? { sixFactorDeliveredConfig }
+        : null,
+    });
+
+    return session;
+  });
+
+  return {
+    sessionId: stored.sessionId,
+    evaluationEpisodeId: resolvedEpisode.episode.id,
+    evaluation,
+    generationSource,
+    generationPackage,
+    card,
+    renderedContent,
+    sixFactorDeliveredConfig,
+  };
+}
